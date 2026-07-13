@@ -1,0 +1,18 @@
+# Python
+__pycache__/
+*.pyc
+
+# macOS zip/archive cruft
+__MACOSX/
+.DS_Store
+
+# Personal/client project work — not part of the public tool
+Tasks/
+PROJECT_LOG.md
+
+# Bridge runtime artifacts (session-specific, regenerated on every use)
+bridge/command.json
+bridge/command.processed.json
+bridge/result.json
+bridge/preview*.png
+bridge/*.setting

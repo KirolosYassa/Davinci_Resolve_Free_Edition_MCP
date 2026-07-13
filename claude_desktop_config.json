@@ -1,0 +1,18 @@
+{
+  "_comment": "Paste the 'davinci_resolve_mcp' block into your Claude Desktop config.",
+  "_config_location_mac":   "~/Library/Application Support/Claude/claude_desktop_config.json",
+  "_config_location_win":   "%APPDATA%\\Claude\\claude_desktop_config.json",
+
+  "mcpServers": {
+    "davinci_resolve_mcp": {
+      "command": "python3",
+      "args": [
+        "/ABSOLUTE/PATH/TO/davinci_resolve_mcp/server.py"
+      ],
+      "env": {
+        "_comment_RESOLVE_SCRIPT_API": "Only needed if auto-detection fails. Set to the Modules directory.",
+        "RESOLVE_SCRIPT_API": ""
+      }
+    }
+  }
+}
