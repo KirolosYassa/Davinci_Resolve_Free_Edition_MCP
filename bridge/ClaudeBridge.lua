@@ -665,6 +665,34 @@ ACTIONS.fusion_save_tool_settings = function(params)
   return { success = ok and true or false, file_path = file_path }
 end
 
+-- Added 2026-07-13 (session 4, node-graph readability pass). Moves a tool's
+-- icon in the Fusion Flow view — cosmetic only, has zero effect on render
+-- output or wiring. Distinct from fusion_add_tool's xpos/ypos, which only
+-- apply once at creation time (and were never actually used — every tool
+-- built so far defaulted to (0,0), which is why the flow view is currently
+-- an unreadable stack).
+-- FIRST ATTEMPT (failed loudly, not silently): `tool:SetPos({x,y})` errored
+-- "attempt to call method 'SetPos' (a nil value)" on all 132 calls — SetPos
+-- is not a method on the Tool object in this Fusion build. CORRECTED: the
+-- real API puts flow positioning on the comp's FlowView object instead —
+-- `comp.CurrentFrame.FlowView:SetPos(tool, {x,y})`. Still unverified as of
+-- this second write; watch result.json closely on the next run.
+ACTIONS.fusion_set_tool_position = function(params)
+  local tool_name = need(params, "tool_name")
+  local xpos = need(params, "xpos")
+  local ypos = need(params, "ypos")
+  local tool = ftool(tool_name)
+  local comp = fcomp()
+  local ok, err = pcall(function()
+    local flow = comp.CurrentFrame.FlowView
+    flow:SetPos(tool, { xpos, ypos })
+  end)
+  if not ok then
+    error("SetPos failed for '" .. tool_name .. "': " .. tostring(err))
+  end
+  return { success = true, tool_name = tool_name, xpos = xpos, ypos = ypos }
+end
+
 -- ── Self-verification additions (2026-07-13) ────────────────────────────
 -- Added so Claude can confirm its own work (exact param values already on
 -- a tool, and a rendered preview frame) instead of relying on a user
@@ -688,6 +716,48 @@ ACTIONS.fusion_get_inputs = function(params)
     success = table_count(failed) == 0,
     tool_name = tool_name,
     values = values,
+    failed = failed,
+  }
+end
+
+-- Added 2026-07-13 (session 4) specifically to unblock the L7 banner-text
+-- mystery: fusion_get_inputs only confirms static parameter VALUES stuck
+-- (StyledText, Center, color, etc.) — it says nothing about whether an
+-- image input like a Merge's Background/Foreground is actually WIRED to
+-- the tool it's supposed to be. Uses the field-access idiom for Fusion's
+-- Input objects (`tool[id]`, not the `tool:GetInput(id)` method used
+-- above) since that's the documented path to an Input object's
+-- GetConnectedOutput()/Output:GetTool() pair. UNVERIFIED as of first
+-- write — never called live before, watch result.json closely.
+ACTIONS.fusion_get_connections = function(params)
+  local tool_name = need(params, "tool_name")
+  local keys = need(params, "keys")
+  local tool = ftool(tool_name)
+  local connections, failed = {}, {}
+  for _, key in ipairs(keys) do
+    local ok, err = pcall(function()
+      local input = tool[key]
+      if input == nil then
+        connections[key] = { exists = false }
+        return
+      end
+      local out = input:GetConnectedOutput()
+      if out == nil then
+        connections[key] = { connected = false }
+      else
+        local src_tool = out.GetTool and out:GetTool() or nil
+        local src_name = src_tool and src_tool:GetAttrs()["TOOLS_Name"] or nil
+        connections[key] = { connected = true, source_tool = src_name }
+      end
+    end)
+    if not ok then
+      failed[key] = tostring(err)
+    end
+  end
+  return {
+    success = table_count(failed) == 0,
+    tool_name = tool_name,
+    connections = connections,
     failed = failed,
   }
 end

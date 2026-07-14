@@ -16,3 +16,6 @@ bridge/command.processed.json
 bridge/result.json
 bridge/preview*.png
 bridge/*.setting
+
+# Claude skill package — personal Cowork skill, not part of the public tool
+davinci-resolve-fusion-bridge.skill

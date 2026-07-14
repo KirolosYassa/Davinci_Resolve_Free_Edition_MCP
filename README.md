@@ -44,121 +44,10 @@ since there's no network path from a cloud sandbox to your laptop.
 
 ---
 
-## Path A — DaVinci Resolve Studio (`server.py`)
+## Capabilities & Functions
 
-### 0. Requirements
-- DaVinci Resolve **Studio**, installed and opened at least once.
-- Python 3.9–3.11.
-- Claude Desktop, installed and signed in.
-
-### 1. Turn on external scripting
-DaVinci Resolve → **Preferences → System → General** (menu path varies
-slightly by version) → **External scripting using** → set to **Local**.
-Restart Resolve.
-
-### 2. Set environment variables
-Add these as **System** environment variables (Start → "Edit the system
-environment variables"), not just user variables:
-
-| Variable | Value |
-|---|---|
-| `RESOLVE_SCRIPT_API` | `C:\ProgramData\Blackmagic Design\DaVinci Resolve\Support\Developer\Scripting` |
-| `RESOLVE_SCRIPT_LIB` | `C:\Program Files\Blackmagic Design\DaVinci Resolve\fusionscript.dll` |
-| `PYTHONPATH` | `%PYTHONPATH%;%RESOLVE_SCRIPT_API%\Modules` |
-
-(macOS/Linux: same idea, different paths — see Blackmagic's own scripting
-README under `.../Support/Developer/Scripting/README.txt` for your platform's
-paths.)
-
-Log out and back in (or reboot) so every app — including Claude Desktop —
-picks up the new variables.
-
-### 3. Install dependencies
-```
-cd path/to/davinci_resolve_mcp
-pip install -r requirements.txt
-pip install pydantic
-```
-
-### 4. Point Claude Desktop at the server
-Open (or create) your Claude Desktop config:
-- macOS: `~/Library/Application Support/Claude/claude_desktop_config.json`
-- Windows: `%APPDATA%\Claude\claude_desktop_config.json`
-
-Merge in the block from `claude_desktop_config.json` in this repo, with the
-path updated to where you cloned it:
-
-```json
-{
-  "mcpServers": {
-    "davinci_resolve_mcp": {
-      "command": "python3",
-      "args": ["/ABSOLUTE/PATH/TO/davinci_resolve_mcp/server.py"]
-    }
-  }
-}
-```
-
-Fully quit and reopen Claude Desktop (from the system tray/menu bar icon, not
-just closing the window).
-
-### 5. Test it
-Open Resolve with a project and timeline active, then in Claude Desktop:
-*"Call resolve_get_info."* You should get back the product name, version,
-and current page. If that works, you're live — full details in
-[`WINDOWS_SETUP_GUIDE.md`](WINDOWS_SETUP_GUIDE.md) (Windows-specific, but the
-troubleshooting section applies everywhere).
-
----
-
-## Path B — DaVinci Resolve Free (`ClaudeBridge.lua`)
-
-No live connection — instead, Claude writes a small JSON command queue, you
-trigger one Lua script from inside Resolve's Scripts menu, and Claude reads
-back the result. One manual click per batch, but each batch can hold as many
-commands as you want.
-
-### Install
-1. Copy `bridge/ClaudeBridge.lua` into:
-   ```
-   %APPDATA%\Blackmagic Design\DaVinci Resolve\Support\Fusion\Scripts\Utility\
-   ```
-   (macOS: `~/Library/Application Support/Blackmagic Design/DaVinci Resolve/Fusion/Scripts/Utility/`.
-   Create the `Utility` folder if it's missing.)
-
-   **Tip:** symlink instead of copy (`mklink` on Windows, `ln -s` on
-   macOS/Linux) so edits to the file in this repo take effect immediately,
-   with no re-copy step:
-   ```
-   mklink "%APPDATA%\Blackmagic Design\DaVinci Resolve\Support\Fusion\Scripts\Utility\ClaudeBridge.lua" "C:\path\to\davinci_resolve_mcp\bridge\ClaudeBridge.lua"
-   ```
-2. Restart Resolve (or reopen the Workspace menu) so it re-scans Scripts
-   folders.
-3. Confirm **Workspace > Scripts > Utility > ClaudeBridge** now shows up —
-   it's under Utility, so it appears on every page (Edit, Fusion, Color…).
-
-### Test it
-1. Open a project in Resolve (a timeline isn't required for `get_info`).
-2. Create `bridge/command.json`:
-   ```json
-   { "commands": [ { "action": "get_info", "params": {} } ] }
-   ```
-3. Run **Workspace > Scripts > Utility > ClaudeBridge**. It gives no popup by
-   design — just a Console print and a silent file write.
-4. Check `bridge/result.json` — you should see your real Resolve version and
-   current page. If that's there, the bridge is live.
-
-### Everyday use
-Ask Claude for the edit you want; it writes `bridge/command.json` for you.
-Run ClaudeBridge from the Scripts menu, then tell Claude what
-`bridge/result.json` shows (or let it read the file directly).
-
-Full action reference, protocol details, and known limitations:
-[`BRIDGE_SETUP_GUIDE.md`](BRIDGE_SETUP_GUIDE.md).
-
----
-
-## What you can do with it
+Everything this project can currently do, independent of setup — see
+**Agent Onboarding** below for how to actually get either path running.
 
 ### Core editing (both paths)
 Project/timeline management, media pool, markers, timecode, import/append,
@@ -180,6 +69,8 @@ connections — instead of hand-placing everything in the UI:
 | `fusion_connect` | Wire one node's output into another node's input. |
 | `fusion_delete_tool` | Remove a node. |
 | `fusion_save_tool_settings` | Serialize a node + its upstream tree to a `.setting` file. |
+| `fusion_set_tool_position` | Move a tool's icon position in the Fusion Flow view — cosmetic node-graph layout only, no effect on render output or wiring. |
+| `fusion_get_connections` | Read which tool/output is actually wired into a node's inputs — confirms real connections, not just stored values (see `fusion_get_inputs` for values-only checks). |
 | `fusion_render_preview` (Path B) | Render one frame to a PNG so Claude can read the actual composite instead of waiting on a screenshot. Treat as experimental — see Known Limitations. |
 
 ### Reusable title builder: narration banner + journey stepper
@@ -193,9 +84,7 @@ upcoming) — so it's reusable for any step-by-step walkthrough, not tied to
 any one project. It's a structural first pass: treat exact pixel offsets as
 a finishing pass once you can see it in the Inspector.
 
----
-
-## Fusion scripting notes (learned the hard way)
+### Fusion scripting notes (learned the hard way)
 
 Genuinely useful if you're extending this project's Fusion tooling — these
 came from live trial and error against real Resolve, not the docs:
@@ -231,37 +120,27 @@ came from live trial and error against real Resolve, not the docs:
 - **Every trigger of `ClaudeBridge.lua` is a fresh Lua process** — the
   attached comp and tool cache from a previous run don't persist. Any Fusion
   job needs `fusion_get_comp` queued in the *same* batch as everything else.
+- **Node position is set via the comp's `FlowView`, not the tool itself** —
+  `tool:SetPos(...)` doesn't exist on the Tool object and errors loudly; the
+  working call is `comp.CurrentFrame.FlowView:SetPos(tool, {x, y})`.
+- **`fusion_get_inputs` only proves a value is stored — not that it's
+  actually connected.** A `Merge`'s `Background`/`Foreground` can hold a
+  correct-looking value while still not being wired to the tool you think
+  feeds it. `fusion_get_connections` (via `tool[key]:GetConnectedOutput()`)
+  confirms the real wiring separately.
 
----
-
-## Repository layout
-
-```
-server.py                  MCP server for Path A (Studio) — 39 tools, stdio transport
-requirements.txt           Python deps for server.py
-claude_desktop_config.json Claude Desktop config snippet template
-bridge/ClaudeBridge.lua    Path B script — install into Resolve's Scripts/Utility folder
-WINDOWS_SETUP_GUIDE.md     Full Path A walkthrough + troubleshooting
-BRIDGE_SETUP_GUIDE.md      Full Path B walkthrough + protocol + action reference
-```
-
-`bridge/command.json`, `bridge/result.json`, `bridge/command.processed.json`,
-and any `bridge/preview*.png` are per-session working files (gitignored) —
-they get created/overwritten every time you use the bridge, not shipped in
-the repo.
-
----
-
-## Known limitations
+### Known limitations
 
 - **Path B is not live** — every batch needs one manual click in Resolve. A
   Lua script can't poll in the background without freezing Resolve's UI.
 - **`fusion_render_preview` (Path B) is experimental** — it worked cleanly
   the first time in testing, then crashed Resolve on a later call, possibly
   from re-rendering while the graph was being edited in the same batch.
-  Recommended: don't combine graph edits and a render-preview call in the
-  same batch — render as a separate, read-only-safe follow-up once graph
-  changes are already confirmed via `fusion_get_inputs`/`fusion_list_tools`.
+  Also confirmed to silently ignore which tool/file it's asked to render on
+  a Resolve-hosted comp — it re-renders whatever `MediaOut1` currently
+  outputs, not necessarily the tool you pointed it at. Trust
+  `fusion_get_inputs`/`fusion_get_connections` for diagnosis; treat this
+  action as "what does `MediaOut1` show right now," nothing more specific.
 - **Path B doesn't yet cover render/deliver jobs or color/LUT application**
   — those exist in `server.py` (Path A) but haven't been ported to
   `ClaudeBridge.lua` yet. Contributions welcome (see below).
@@ -273,15 +152,112 @@ the repo.
 
 ---
 
-## Contributing
+## Agent Onboarding
 
-Issues and PRs welcome — especially:
-- Porting the remaining `server.py` render/color tools into
-  `ClaudeBridge.lua` for feature parity between the two paths.
-- Confirming/expanding the Fusion input-name cheat sheet above (gradient
-  fills, hollow-ring masks, justification enums are all open questions).
-- Testing on macOS/Linux (this project was built and tested on Windows).
+Everything an AI agent (Claude or otherwise) needs to go from "just forked
+this repo" to "actually driving Resolve," plus the conventions that keep a
+multi-session project like this recoverable instead of re-discovered from
+scratch every time.
 
-## License
+### Path A — DaVinci Resolve Studio (`server.py`)
 
-MIT — see [LICENSE](LICENSE).
+#### 0. Requirements
+- DaVinci Resolve **Studio**, installed and opened at least once.
+- Python 3.9–3.11.
+- Claude Desktop, installed and signed in.
+
+#### 1. Turn on external scripting
+DaVinci Resolve → **Preferences → System → General** (menu path varies
+slightly by version) → **External scripting using** → set to **Local**.
+Restart Resolve.
+
+#### 2. Set environment variables
+Add these as **System** environment variables (Start → "Edit the system
+environment variables"), not just user variables:
+
+| Variable | Value |
+|---|---|
+| `RESOLVE_SCRIPT_API` | `C:\ProgramData\Blackmagic Design\DaVinci Resolve\Support\Developer\Scripting` |
+| `RESOLVE_SCRIPT_LIB` | `C:\Program Files\Blackmagic Design\DaVinci Resolve\fusionscript.dll` |
+| `PYTHONPATH` | `%PYTHONPATH%;%RESOLVE_SCRIPT_API%\Modules` |
+
+(macOS/Linux: same idea, different paths — see Blackmagic's own scripting
+README under `.../Support/Developer/Scripting/README.txt` for your platform's
+paths.)
+
+Log out and back in (or reboot) so every app — including Claude Desktop —
+picks up the new variables.
+
+#### 3. Install dependencies
+```
+cd path/to/davinci_resolve_mcp
+pip install -r requirements.txt
+pip install pydantic
+```
+
+#### 4. Point your AI agent at the server
+Open (or create) your Claude Desktop config:
+- macOS: `~/Library/Application Support/Claude/claude_desktop_config.json`
+- Windows: `%APPDATA%\Claude\claude_desktop_config.json`
+
+Merge in the block from `claude_desktop_config.json` in this repo, with the
+path updated to where you cloned it:
+
+```json
+{
+  "mcpServers": {
+    "davinci_resolve_mcp": {
+      "command": "python3",
+      "args": ["/ABSOLUTE/PATH/TO/davinci_resolve_mcp/server.py"]
+    }
+  }
+}
+```
+
+Fully quit and reopen Claude Desktop (from the system tray/menu bar icon, not
+just closing the window). Using a different MCP-capable agent instead of
+Claude Desktop? The same idea applies — `server.py` speaks standard MCP over
+stdio, so any MCP client just needs to be pointed at it the way its own
+config format expects.
+
+#### 5. Test it
+Open Resolve with a project and timeline active, then ask your agent:
+*"Call resolve_get_info."* You should get back the product name, version,
+and current page. If that works, you're live — full details in
+[`WINDOWS_SETUP_GUIDE.md`](WINDOWS_SETUP_GUIDE.md) (Windows-specific, but the
+troubleshooting section applies everywhere).
+
+### Path B — DaVinci Resolve Free (`ClaudeBridge.lua`)
+
+No live connection — instead, your agent writes a small JSON command queue,
+you trigger one Lua script from inside Resolve's Scripts menu, and the agent
+reads back the result. One manual click per batch, but each batch can hold
+as many commands as you want.
+
+#### Install
+1. Copy `bridge/ClaudeBridge.lua` into:
+   ```
+   %APPDATA%\Blackmagic Design\DaVinci Resolve\Support\Fusion\Scripts\Utility\
+   ```
+   (macOS: `~/Library/Application Support/Blackmagic Design/DaVinci Resolve/Fusion/Scripts/Utility/`.
+   Create the `Utility` folder if it's missing.)
+
+   **Tip:** symlink instead of copy (`mklink` on Windows, `ln -s` on
+   macOS/Linux) so edits to the file in this repo take effect immediately,
+   with no re-copy step:
+   ```
+   mklink "%APPDATA%\Blackmagic Design\DaVinci Resolve\Support\Fusion\Scripts\Utility\ClaudeBridge.lua" "C:\path\to\davinci_resolve_mcp\bridge\ClaudeBridge.lua"
+   ```
+2. Restart Resolve (or reopen the Workspace menu) so it re-scans Scripts
+   folders.
+3. Confirm **Workspace > Scripts > Utility > ClaudeBridge** now shows up —
+   it's under Utility, so it appears on every page (Edit, Fusion, Color…).
+
+#### Test it
+1. Open a project in Resolve (a timeline isn't required for `get_info`).
+2. Create `bridge/command.json`:
+   ```json
+   { "commands": [ { "action": "get_info", "params": {} } ] }
+   ```
+3. Run **Workspace > Scripts > Utility > ClaudeBridge**. It gives no popup by
+   design — just a 
