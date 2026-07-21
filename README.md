@@ -260,4 +260,107 @@ as many commands as you want.
    { "commands": [ { "action": "get_info", "params": {} } ] }
    ```
 3. Run **Workspace > Scripts > Utility > ClaudeBridge**. It gives no popup by
-   design — just a 
+   design — just a Console print and a silent file write.
+4. Check `bridge/result.json` — you should see your real Resolve version and
+   current page. If that's there, the bridge is live.
+
+#### Everyday use
+Ask your agent for the edit you want; it writes `bridge/command.json` for
+you. Run ClaudeBridge from the Scripts menu, then tell it what
+`bridge/result.json` shows (or let it read the file directly). This works
+with any AI agent that can read and write files in this repo's folder and
+prompt you to click one menu item — nothing here is Claude-specific.
+
+Full action reference, protocol details, and known limitations:
+[`BRIDGE_SETUP_GUIDE.md`](BRIDGE_SETUP_GUIDE.md).
+
+### Repository layout
+
+```
+server.py                  MCP server for Path A (Studio) — 39 tools, stdio transport
+requirements.txt           Python deps for server.py
+claude_desktop_config.json Claude Desktop config snippet template
+bridge/ClaudeBridge.lua    Path B script — install into Resolve's Scripts/Utility folder
+WINDOWS_SETUP_GUIDE.md     Full Path A walkthrough + troubleshooting
+BRIDGE_SETUP_GUIDE.md      Full Path B walkthrough + protocol + action reference
+```
+
+`bridge/command.json`, `bridge/result.json`, `bridge/command.processed.json`,
+and any `bridge/preview*.png` are per-session working files (gitignored) —
+they get created/overwritten every time you use the bridge, not shipped in
+the repo.
+
+### Keeping a living project log
+
+This project's actual working practice (not enforced by any script, just a
+convention worth keeping if you fork it) is a single `PROJECT_LOG.md` at the
+repo root that acts as ground truth for **current state, architecture,
+decisions made and why, open items, and a dated session log** — separate
+from this README, which only documents the stable, finished interface.
+
+Why this matters for an AI agent specifically: Fusion's scripting API fails
+in ways that look successful (see "Fusion scripting notes" above — silent
+no-ops, render-time-only errors, a preview tool that quietly renders the
+wrong thing). Without a log, every new session re-discovers the same dead
+ends. With one, a fresh agent — any model, not just Claude — reads
+`PROJECT_LOG.md` first, immediately knows which input names are confirmed
+dead ends, which diagnostic actions are trustworthy, and what was already
+tried and rejected, and can get back to productive work in one read instead
+of one more round of trial and error.
+
+The practice, if you adopt it:
+- Read `PROJECT_LOG.md` in full before making any changes, every session.
+- Keep a **Current State** section updated in place (not appended to) —
+  this is what a new agent reads first.
+- Append every session's work to a dated **Session Log** section instead of
+  overwriting — this is the audit trail for "why is it built this way."
+- Track unresolved work in an **Open Items** checklist, and check items off
+  in place rather than deleting them, so the history of what was fixed
+  isn't lost.
+- Keep any confirmed API quirks (working input names, confirmed dead ends,
+  which diagnostic tools to trust) in one reference section — a "cheat
+  sheet" — so they're looked up, never re-guessed.
+
+### Plug & Run checklist
+
+A condensed, model-agnostic path from "just forked this repo" to "an AI
+agent is driving Resolve," regardless of which agent or model you use:
+
+1. **Fork/clone the repo.**
+2. **Pick your path** based on your Resolve edition — Studio → Path A, Free
+   → Path B (see the comparison table near the top of this README).
+3. **Install dependencies** — `pip install -r requirements.txt` (+
+   `pydantic`) for Path A; no install needed for Path B beyond copying/
+   symlinking the Lua script.
+4. **Connect your agent** — for Path A, point any MCP-capable client at
+   `server.py` (Claude Desktop's config format is provided as a template;
+   adapt the same idea for another client). For Path B, no MCP config is
+   needed at all — just give your agent read/write access to this repo
+   folder so it can write `bridge/command.json` and read
+   `bridge/result.json`, and be ready to click the Scripts menu item
+   yourself each round.
+5. **Smoke-test** — `resolve_get_info` (Path A) or a `get_info` command
+   (Path B) against a real open Resolve project.
+6. **Start (or continue) `PROJECT_LOG.md`** — if this is a fresh fork, copy
+   the "Keeping a living project log" structure above into a new
+   `PROJECT_LOG.md`; if you're continuing existing work, read it in full
+   before doing anything else.
+7. **Work in batches, verify before trusting** — especially on Path B,
+   where round-trips are manual: queue a batch, trigger it, then confirm
+   with `fusion_get_inputs`/`fusion_get_connections` rather than assuming
+   success from a clean-looking result file.
+
+---
+
+## Contributing
+
+Issues and PRs welcome — especially:
+- Porting the remaining `server.py` render/color tools into
+  `ClaudeBridge.lua` for feature parity between the two paths.
+- Confirming/expanding the Fusion input-name cheat sheet above (gradient
+  fills, hollow-ring masks, justification enums are all open questions).
+- Testing on macOS/Linux (this project was built and tested on Windows).
+
+## License
+
+MIT — see [LICENSE](LICENSE).

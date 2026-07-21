@@ -74,15 +74,24 @@ if your Resolve version lets you bind it to a hotkey — this varies by
 version and wasn't confirmed working at the time this was written, so
 treat it as worth trying rather than guaranteed.
 
-## Supported actions (v1)
+## Supported actions
 
-Matches the read/write core of `server.py`'s tool set, minus render
-jobs, color/LUTs, and Fusion node-graph building — those weren't
-ported yet. Each command in the queue looks like:
+Started as the read/write core of `server.py`'s tool set and has since grown
+past it: Fusion node-graph building/inspection and a dedicated set of
+banner/overlay-image placement actions (useful any time you need to drop a
+sequence of still images onto a timeline at specific frames — lower-thirds,
+title cards, chapter banners, etc.) are now included too. Render jobs and
+color/LUT actions are still not ported. Each command in the queue looks like:
 
 ```json
 { "action": "<name>", "params": { ... } }
 ```
+
+Multiple commands can be queued in one `command.json` and will all run in
+order on a single trigger, with per-command error isolation — one bad action
+won't block the rest.
+
+### Project & page
 
 | action | params | notes |
 |---|---|---|
@@ -91,39 +100,92 @@ ported yet. Each command in the queue looks like:
 | `list_projects` | — | |
 | `get_project_info` | — | name, timeline count |
 | `get_project_settings` | `setting_name` (optional) | omit for all settings |
+
+### Timeline
+
+| action | params | notes |
+|---|---|---|
 | `list_timelines` | — | |
-| `get_timeline_info` | — | active timeline only |
+| `get_timeline_info` | — | active timeline only; returns name, `start_frame`, `end_frame`, `current_timecode`, video/audio track counts, and `frame_rate` (the latter two needed to convert a real-world timestamp into an absolute Resolve frame number) |
 | `create_timeline` | `name` | |
 | `set_current_timeline` | `timeline_name` or `timeline_index` | |
-| `get_timeline_items` | `track_type`, `track_index` | defaults: video, 1 |
+| `add_track` | `track_type` (default `video`) | `video` / `audio` / `subtitle`. Always appends a new track at the end of that type's list — for video, higher track numbers render on top, so this is the safe way to add an overlay layer without touching what's already there. Returns `count_before`/`count_after`/`new_track_index`. |
+| `get_timeline_items` | `track_type` (default `video`), `track_index` (default `1`) | returns each item's `name`, `start`, `end`, `duration`, `source_start`, `source_end` |
+| `delete_timeline_items` | `track_type` (default `video`), `track_index` | removes every item on that track — there's currently no action to remove the (now-empty) track itself, only its contents |
 | `get_timecode` | — | |
 | `set_timecode` | `timecode` (HH:MM:SS:FF) | |
+
+### Markers
+
+| action | params | notes |
+|---|---|---|
 | `add_marker` | `frame_id`, `color`, `name`, `note`, `duration`, `custom_data` | color/name/note/duration/custom_data optional |
 | `get_markers` | — | |
+| `get_markers_by_color` | `color` | returns matches sorted by frame, each annotated with `end_frame` = the frame of the very next marker on the timeline (any color) — handy for "place something from this marker until the next one" workflows. `end_frame` is `nil` if nothing follows. |
 | `delete_marker` | `frame_num` | |
-| `list_media_pool` | — | current folder only |
+
+### Media Pool & bins
+
+| action | params | notes |
+|---|---|---|
+| `list_media_pool` | `bin_name` (optional) | omit for the current folder; pass a bin name to inspect a specific root-level bin without switching to it |
 | `import_media` | `file_paths` (array) | absolute paths |
 | `create_bin` | `name` | in current Media Pool folder |
+| `clear_bin` | `bin_name` (optional) | deletes every clip in a named root-level bin (or the current folder if omitted) — useful for resetting a bin before a clean re-import |
 | `append_to_timeline` | `clip_names` (array) | clips must already be in Media Pool |
-| `fusion_get_comp` | `track_index`, `clip_index`, `create_if_missing` | attach to (or create) a clip's Fusion comp. **Must be the first Fusion action in the batch** — comp state doesn't persist between separate script triggers. Defaults: track 1, clip 0, create_if_missing true |
+
+### Banner / overlay image placement
+
+A small extension beyond `server.py`'s original tool set, for dropping a
+sequence of still images (banners, title cards, lower-thirds) onto a
+timeline at specific frames.
+
+| action | params | notes |
+|---|---|---|
+| `import_banner_images` | `file_paths` (array), `bin_name` (optional) | imports each file in its own `ImportMedia` call (importing several sequentially-numbered stills together in one call can trigger Resolve's image-sequence auto-detection and merge them into one clip — importing one at a time avoids that). If `bin_name` is given, finds-or-creates a root-level bin with that name and imports into it. Caches the resulting clips in order for `place_clip_on_track` to reference in the same batch. |
+| `place_clip_on_track` | `clip_index` (1-based, from `import_banner_images`'s order this batch), `track_index`, `start_frame`, `end_frame` | places one imported clip at an exact frame range. Internally calls `MediaPoolItem:SetMarkInOut` before appending — a still image's native duration is 1 frame, so the mark in/out is what actually controls its on-timeline length. **Must run in the same `command.json` batch as the `import_banner_images` call it references** — the imported-clip cache doesn't persist between separate script triggers. |
+| `refresh_bin_clips` | `bin_name`, `file_paths` (optional) | for each matching clip, calls `MediaPoolItem:ReplaceClip()` with its own current file path — reloads a regenerated PNG from disk into the *same* MediaPoolItem, so every place it's used on the timeline updates automatically without touching timeline position, track, or trim. Omit `file_paths` to refresh the whole bin. This is the way to push new pixels into an already-placed clip without disturbing anything about where it sits. |
+
+**A note on inserting a new item between two already-placed ones:** clips
+placed back-to-back on one track share frame boundaries with no gap, so
+there's usually nowhere to insert without either trimming a neighbor or
+overlaying on a separate track. `add_track` + `place_clip_on_track` on the
+new (topmost) track is the safe way to do this — it renders on top of
+whatever's on the original track for that window, with zero edits to
+anything already placed. Overwriting a neighboring clip's own file via
+`refresh_bin_clips` to "make room" is possible but destructive — it replaces
+that clip's content outright, it doesn't visually layer alongside it.
+
+### Fusion compositing
+
+Ported from `server.py`'s `resolve_fusion_*` tools. Best-effort against the
+documented Fusion scripting API — exact input names and enum values can
+vary by Resolve version, so treat a new action's first real use as a
+debugging pass rather than a guaranteed result.
+
+**Every trigger of `ClaudeBridge.lua` is a fresh Lua process**, so the
+attached composition and tool cache from a previous run are gone by the next
+click. `fusion_get_comp` must be the first Fusion action queued, in the same
+`command.json` batch as the rest of that job's steps.
+
+| action | params | notes |
+|---|---|---|
+| `fusion_get_comp` | `track_index` (default 1), `clip_index` (default 0), `create_if_missing` (default true) | attaches to (or creates) a clip's Fusion comp. **Must be the first Fusion action in the batch.** |
+| `fusion_get_current_comp` | — | attaches to whatever comp is currently open in the Fusion page, instead of addressing a clip by track/index |
 | `fusion_list_tools` | — | every node in the attached comp: `{name, id}` |
+| `fusion_list_inputs` | `tool_name` | lists every Inspector input name available on a tool (handy for discovering valid keys before calling `fusion_set_inputs`) |
 | `fusion_add_tool` | `tool_id`, `name`, `xpos`, `ypos` | e.g. `tool_id: "Background"`, `"TextPlus"`, `"Merge"`, `"RectangleMask"`; `name` is your reference name for later calls |
 | `fusion_set_inputs` | `tool_name`, `inputs` (map) | sets one or more Inspector fields; per-field error isolation — a wrong name reports in `failed` without blocking the rest |
+| `fusion_set_inputs_at_time` | `tool_name`, `inputs` (map), `time` | same as above but at a specific comp time, for keyframing |
+| `fusion_get_inputs` | `tool_name`, `keys` (array) | reads current Inspector values back — self-check tool positions/colors instead of re-guessing them; per-key error isolation like `fusion_set_inputs` |
+| `fusion_get_inputs_at_time` | `tool_name`, `keys` (array), `time` | same as above but at a specific comp time |
+| `fusion_get_connections` | `tool_name`, `keys` (array) | reads what's wired into the given input keys, via each key's `GetConnectedOutput()`/`Output:GetTool()` pair |
 | `fusion_connect` | `from_tool`, `to_tool`, `to_input` | wires one tool's output into another's input; `to_input` defaults to `"Input"` |
+| `fusion_set_tool_position` | `tool_name`, `xpos`, `ypos` | repositions a node in the Fusion Nodes panel (`FlowView:SetPos`) — useful for keeping a growing node graph readable |
 | `fusion_delete_tool` | `tool_name` | |
 | `fusion_save_tool_settings` | `tool_name`, `file_path` | serializes a tool + its upstream tree to a `.setting` file |
-| `fusion_get_inputs` | `tool_name`, `keys` (array) | reads current Inspector values back — self-check tool positions/colors instead of re-guessing them; per-key error isolation like `fusion_set_inputs` |
-| `fusion_render_preview` | `source_tool` (default `MediaOut1`), `file_path`, `frame` (optional, defaults to comp's current time) | renders one frame to a PNG/file via a reusable hidden `_ClaudeBridge_PreviewSaver` node, so Claude can read the actual composite instead of waiting on a screenshot. **Unverified as of 2026-07-13** — first live use of `comp:Render()` from inside Resolve's Fusion page. |
-
-Multiple commands can be queued in one `command.json` and will all run
-in order on a single trigger, with per-command error isolation — one
-bad action won't block the rest.
-
-**Fusion-specific note:** every trigger of `ClaudeBridge.lua` is a fresh Lua
-process, so the attached composition and tool cache from a previous run are
-gone by the next click. Any Fusion job — even just adding two nodes — must
-queue `fusion_get_comp` together with the rest of the steps in the *same*
-`command.json` batch.
+| `fusion_create_macro` | `tool_names` (array, ordered) | selects the given tools (order determines the resulting macro's control layout) and attempts to group them into a macro, trying a few different Fusion API entry points since behavior varies by version; reports which attempt (if any) succeeded |
+| `fusion_render_preview` | `source_tool` (default `MediaOut1`), `file_path`, `frame` (optional, defaults to comp's current time) | renders one frame to a PNG/file via a reusable hidden `_ClaudeBridge_PreviewSaver` node, so you can read back the actual composite instead of relying on a screenshot |
 
 ## Known limitations
 
