@@ -271,7 +271,8 @@ you. Run ClaudeBridge from the Scripts menu, then tell it what
 with any AI agent that can read and write files in this repo's folder and
 prompt you to click one menu item — nothing here is Claude-specific.
 
-Full action reference, protocol details, and known limitations:
+Full action-by-action capability list: [`CAPABILITIES.md`](CAPABILITIES.md).
+Install steps, protocol details, and known limitations:
 [`BRIDGE_SETUP_GUIDE.md`](BRIDGE_SETUP_GUIDE.md).
 
 ### Repository layout
@@ -282,7 +283,8 @@ requirements.txt           Python deps for server.py
 claude_desktop_config.json Claude Desktop config snippet template
 bridge/ClaudeBridge.lua    Path B script — install into Resolve's Scripts/Utility folder
 WINDOWS_SETUP_GUIDE.md     Full Path A walkthrough + troubleshooting
-BRIDGE_SETUP_GUIDE.md      Full Path B walkthrough + protocol + action reference
+BRIDGE_SETUP_GUIDE.md      Full Path B walkthrough + protocol
+CAPABILITIES.md            Full action-by-action reference for ClaudeBridge.lua
 ```
 
 `bridge/command.json`, `bridge/result.json`, `bridge/command.processed.json`,
