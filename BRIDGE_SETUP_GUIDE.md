@@ -112,6 +112,7 @@ won't block the rest.
 | `add_track` | `track_type` (default `video`) | `video` / `audio` / `subtitle`. Always appends a new track at the end of that type's list — for video, higher track numbers render on top, so this is the safe way to add an overlay layer without touching what's already there. Returns `count_before`/`count_after`/`new_track_index`. |
 | `get_timeline_items` | `track_type` (default `video`), `track_index` (default `1`) | returns each item's `name`, `start`, `end`, `duration`, `source_start`, `source_end` |
 | `delete_timeline_items` | `track_type` (default `video`), `track_index` | removes every item on that track — there's currently no action to remove the (now-empty) track itself, only its contents |
+| `remove_timeline_items` | `track_type` (default `video`), `track_index`, `names` (array, required) | deletes only the named clips from a track instead of wiping the whole thing — requires a non-empty `names` list so it can never wipe a track by omission; any name that doesn't match a current clip on that track comes back in the response instead of failing silently |
 | `get_timecode` | — | |
 | `set_timecode` | `timecode` (HH:MM:SS:FF) | |
 
@@ -132,6 +133,7 @@ won't block the rest.
 | `import_media` | `file_paths` (array) | absolute paths |
 | `create_bin` | `name` | in current Media Pool folder |
 | `clear_bin` | `bin_name` (optional) | deletes every clip in a named root-level bin (or the current folder if omitted) — useful for resetting a bin before a clean re-import |
+| `remove_clips` | `bin_name`, `names` (array) and/or `file_paths` (array), `force` (optional) | deletes specific clips from a bin by name and/or source path, instead of `clear_bin`'s all-or-nothing sweep — handy for cleaning up a handful of orphaned stills from a bin that also holds source footage you want to keep. By default refuses to delete any clip currently used on the active timeline (`MediaPool:DeleteClips()` silently removes every timeline instance too) — those come back in `in_use_skipped`; pass `force=true` to delete them anyway. Reports any selector that matched nothing in `not_found` rather than a silent no-op. |
 | `append_to_timeline` | `clip_names` (array) | clips must already be in Media Pool |
 
 ### Banner / overlay image placement
@@ -145,6 +147,8 @@ timeline at specific frames.
 | `import_banner_images` | `file_paths` (array), `bin_name` (optional) | imports each file in its own `ImportMedia` call (importing several sequentially-numbered stills together in one call can trigger Resolve's image-sequence auto-detection and merge them into one clip — importing one at a time avoids that). If `bin_name` is given, finds-or-creates a root-level bin with that name and imports into it. Caches the resulting clips in order for `place_clip_on_track` to reference in the same batch. |
 | `place_clip_on_track` | `clip_index` (1-based, from `import_banner_images`'s order this batch), `track_index`, `start_frame`, `end_frame` | places one imported clip at an exact frame range. Internally calls `MediaPoolItem:SetMarkInOut` before appending — a still image's native duration is 1 frame, so the mark in/out is what actually controls its on-timeline length. **Must run in the same `command.json` batch as the `import_banner_images` call it references** — the imported-clip cache doesn't persist between separate script triggers. |
 | `refresh_bin_clips` | `bin_name`, `file_paths` (optional) | for each matching clip, calls `MediaPoolItem:ReplaceClip()` with its own current file path — reloads a regenerated PNG from disk into the *same* MediaPoolItem, so every place it's used on the timeline updates automatically without touching timeline position, track, or trim. Omit `file_paths` to refresh the whole bin. This is the way to push new pixels into an already-placed clip without disturbing anything about where it sits. |
+| `relink_bin_clips` | `mappings` (array of `{old_path, new_path}`), `bin_name` (optional) | `refresh_bin_clips`'s sibling — calls `ReplaceClip()` with a *different* path instead of the clip's own, which is how a still gets renamed on disk without the timeline noticing: every `TimelineItem` referencing that `MediaPoolItem` keeps its position, duration, and trim, because `ReplaceClip` only swaps what the `MediaPoolItem` points at. Useful when migrating a batch of placed stills to a new, stable naming scheme without discarding manual trims. Matches by each clip's current File Path — a path matching more than one clip is reported as a failure rather than guessed. Read back `path_confirmed` on each result: `ReplaceClip` can report success while leaving the clip pointed at the old file. |
+| `rename_bin_clips` | `renames` (array of `{file_path, name}`), `bin_name` (optional) | `relink_bin_clips` usually makes a clip's display name follow its new filename automatically, but not always — this sets the label directly. Matches by File Path, never by name (the name is the thing you're fixing). Useful as a follow-up pass after a bulk relink to confirm every clip's label actually matches its new file. |
 
 **A note on inserting a new item between two already-placed ones:** clips
 placed back-to-back on one track share frame boundaries with no gap, so
@@ -155,6 +159,21 @@ whatever's on the original track for that window, with zero edits to
 anything already placed. Overwriting a neighboring clip's own file via
 `refresh_bin_clips` to "make room" is possible but destructive — it replaces
 that clip's content outright, it doesn't visually layer alongside it.
+
+### Banner fade cleanup
+
+`set_clip_fade` — an earlier attempt at scripting a per-clip opacity fade by
+building a keyframed Fusion node graph (`MediaIn -> BrightnessContrast ->
+MediaOut` with a keyframed alpha ramp) — is **retired and fails closed**: it
+now always returns an error instead of running. In practice, per-frame
+keyframe read-back reported success while the visible fade still sat in the
+wrong place whenever a clip's Fusion comp range didn't match its trimmed
+duration (e.g. media handles left behind by a transition), so it couldn't be
+trusted unattended. Apply fades by hand in Resolve's Edit page instead.
+
+| action | params | notes |
+|---|---|---|
+| `remove_clip_fade` | `track_index` (default 3), `clip_name` or `clip_index` | removes only the fade node this project's tooling would have added to a clip's Fusion comp, leaving the clip, its timing, its comp, and every unrelated Fusion tool untouched — reconnects the fade's source directly to `MediaOut` before deleting the node, then reads back the final wiring to confirm. Cleanup-only; there is no corresponding "add" action. |
 
 ### Fusion compositing
 

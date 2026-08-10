@@ -16,6 +16,14 @@ bridge/command.processed.json
 bridge/result.json
 bridge/preview*.png
 bridge/*.setting
+bridge/*.bak
+
+# Client project working files — not part of the public tool
+bridge/*sweep*.json
+bridge/resolve_deliver_*.png
+output/
+tmp/
+tools/
 
 # Claude skill package — personal Cowork skill, not part of the public tool
 davinci-resolve-fusion-bridge.skill

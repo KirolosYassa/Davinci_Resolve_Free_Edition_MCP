@@ -281,16 +281,48 @@ end
 
 -- Shared by import_banner_images / clear_bin / list_media_pool / refresh_bin_clips
 -- (added 2026-07-21, factored out to avoid duplicating this lookup four times).
--- Finds an existing root-level Media Pool subfolder with the given name.
+-- Finds an existing Media Pool subfolder by name. Two modes:
+--   - bin_name contains "/" (e.g. "Banners/ProjectA"): walks that exact path
+--     from the root, one path segment at a time -- unambiguous even when
+--     multiple folders share a leaf name (confirmed live 2026-07-22: this
+--     project has BOTH Master/Banners/ProjectA (banner PNGs) and
+--     Master/Footages/ProjectA (raw source clips), so a same-name search
+--     alone is genuinely ambiguous).
+--   - bin_name has no "/": breadth-first whole-tree search, first match wins
+--     (original 2026-07-21 behavior, kept for callers that only know a plain
+--     name and whose bin happens to be uniquely named).
 -- Returns the folder, or nil if not found (caller decides whether that's an
 -- error or a "create it" signal).
 local function find_bin_by_name(mp, bin_name)
   local root = mp:GetRootFolder()
   if not root then error("Could not get the Media Pool's root folder.") end
-  local subfolders = root:GetSubFolderList() or {}
-  for _, f in ipairs(subfolders) do
-    local ok, fname = pcall(function() return f:GetName() end)
-    if ok and fname == bin_name then return f end
+
+  if bin_name:find("/", 1, true) then
+    local current = root
+    for segment in bin_name:gmatch("[^/]+") do
+      local subfolders = current:GetSubFolderList() or {}
+      local next_folder = nil
+      for _, f in ipairs(subfolders) do
+        local ok, fname = pcall(function() return f:GetName() end)
+        if ok and fname == segment then next_folder = f break end
+      end
+      if not next_folder then return nil end
+      current = next_folder
+    end
+    return current
+  end
+
+  local queue = { root }
+  local head = 1
+  while head <= #queue do
+    local folder = queue[head]
+    head = head + 1
+    local subfolders = folder:GetSubFolderList() or {}
+    for _, f in ipairs(subfolders) do
+      local ok, fname = pcall(function() return f:GetName() end)
+      if ok and fname == bin_name then return f end
+      queue[#queue+1] = f
+    end
   end
   return nil
 end
@@ -507,6 +539,72 @@ ACTIONS.delete_timeline_items = function(params)
   return { success = ok and true or false, deleted_count = #items }
 end
 
+-- Added 2026-08-04 -- delete_timeline_items above wipes an ENTIRE track,
+-- which is too blunt when only one clip out of a placed set needs to go
+-- (e.g. a scene that existed when banners were first placed was later
+-- deleted from the source list, orphaning just its one clip -- confirmed
+-- live 2026-08-04). Mirrors remove_clips' safe by-name selector: requires an
+-- explicit non-empty `names` list so it can never wipe a track by omission,
+-- and reports any name that didn't match a current clip on that track
+-- instead of silently no-op'ing a typo.
+ACTIONS.remove_timeline_items = function(params)
+  local track_type = params.track_type or "video"
+  local track_index = need(params, "track_index")
+  local names = params.names
+  if not names or #names == 0 then
+    error("remove_timeline_items requires a non-empty 'names' list. To wipe " ..
+          "an entire track, use delete_timeline_items explicitly.")
+  end
+  if track_type ~= "video" and track_type ~= "audio" then
+    error("track_type must be 'video' or 'audio'.")
+  end
+
+  local t = timeline()
+  local items = t:GetItemListInTrack(track_type, track_index)
+  if items == nil then
+    error(track_type .. " track " .. tostring(track_index) .. " does not exist. Use get_timeline_info to check track counts.")
+  end
+
+  local want = {}
+  for _, n in ipairs(names) do want[n] = true end
+
+  local to_delete, matched, seen = {}, {}, {}
+  for _, item in ipairs(items) do
+    local ok_n, name = pcall(function() return item:GetName() end)
+    if ok_n and name and want[name] then
+      seen[name] = true
+      to_delete[#to_delete+1] = item
+      matched[#matched+1] = {
+        name = name,
+        start = item:GetStart(),
+        ["end"] = item:GetEnd(),
+        duration = item:GetDuration(),
+      }
+    end
+  end
+
+  local not_found = {}
+  for _, n in ipairs(names) do
+    if not seen[n] then not_found[#not_found+1] = n end
+  end
+
+  local ok2 = true
+  if #to_delete > 0 then
+    ok2 = t:DeleteClips(to_delete) and true or false
+  end
+
+  return {
+    success = ok2 and #not_found == 0,
+    deleted_ok = ok2,
+    track_type = track_type,
+    track_index = track_index,
+    deleted_count = #to_delete,
+    deleted = matched,
+    not_found_count = #not_found,
+    not_found = not_found,
+  }
+end
+
 ACTIONS.get_timecode = function(_)
   return { timecode = timeline():GetCurrentTimecode() }
 end
@@ -602,6 +700,125 @@ ACTIONS.clear_bin = function(params)
 end
 
 -- ══════════════════════════════════════════════════════════════════════════
+-- remove_clips — delete SPECIFIC named clips from a bin (added 2026-08-03)
+--
+-- Why this exists: clear_bin is all-or-nothing, so cleaning up a handful of
+-- orphaned stills from a bin that also holds source footage was impossible
+-- without nuking the footage too. The concrete case: ProjectA.r5/r7/r8/r18.png
+-- were rendered from a superseded content-tracking version, deleted from
+-- disk, and left behind as dead offline MediaPoolItems in the
+-- Footages/ProjectA bin.
+--
+-- SAFETY — this is the important part. MediaPool:DeleteClips() also removes
+-- every timeline instance of the clip, silently. That is the same class of
+-- destructive surprise that misaligned a batch of banners once already, so by
+-- default this action REFUSES to delete any clip that is currently used on
+-- the current timeline: those come back in `in_use_skipped` and are left
+-- alone. Pass force=true only when you actually intend to pull clips off the
+-- timeline as well.
+--
+-- Selectors (at least one required — this action will never delete a whole
+-- bin by omission; that is clear_bin's job and should be explicit):
+--   names       : list of clip names, e.g. {"ProjectA.r5.png", "ProjectA.r7.png"}
+--   file_paths  : list of absolute source paths
+-- A clip matching EITHER selector is targeted.
+ACTIONS.remove_clips = function(params)
+  local bin_name = need(params, "bin_name")
+  local names = params.names
+  local file_paths = params.file_paths
+  local force = params.force and true or false
+
+  if (not names or #names == 0) and (not file_paths or #file_paths == 0) then
+    error("remove_clips requires 'names' and/or 'file_paths'. To empty an " ..
+          "entire bin, use clear_bin explicitly.")
+  end
+
+  local mp = proj():GetMediaPool()
+  local folder = find_bin_by_name(mp, bin_name)
+  if not folder then
+    error("No Media Pool bin named '" .. bin_name .. "' found at the root level.")
+  end
+
+  -- Build lookup sets for the selectors.
+  local want_name, want_path = {}, {}
+  if names then for _, n in ipairs(names) do want_name[n] = true end end
+  if file_paths then for _, p in ipairs(file_paths) do want_path[p] = true end end
+
+  -- Collect the names of every clip currently used on the current timeline,
+  -- so we can refuse to yank something out from under the edit.
+  local in_use = {}
+  if not force then
+    local ok_t, t = pcall(timeline)
+    if ok_t and t then
+      for _, tt in ipairs({ "video", "audio" }) do
+        local count = t:GetTrackCount(tt) or 0
+        for ti = 1, count do
+          local items = t:GetItemListInTrack(tt, ti) or {}
+          for _, it in ipairs(items) do
+            local ok_n, n = pcall(function() return it:GetName() end)
+            if ok_n and n then in_use[n] = true end
+          end
+        end
+      end
+    end
+  end
+
+  local clips = folder:GetClipList() or {}
+  local to_delete, matched, in_use_skipped = {}, {}, {}
+  local seen_name, seen_path = {}, {}
+
+  for _, c in ipairs(clips) do
+    local name = c:GetName()
+    local ok_p, path = pcall(function() return c:GetClipProperty("File Path") end)
+    if not ok_p then path = nil end
+
+    local hit = (name and want_name[name]) or (path and want_path[path])
+    if hit then
+      if name then seen_name[name] = true end
+      if path then seen_path[path] = true end
+      if (not force) and name and in_use[name] then
+        in_use_skipped[#in_use_skipped+1] = { name = name, file_path = path }
+      else
+        to_delete[#to_delete+1] = c
+        matched[#matched+1] = { name = name, file_path = path }
+      end
+    end
+  end
+
+  -- Report selectors that matched nothing, so a typo'd name is loud rather
+  -- than silently reported as a successful no-op.
+  local not_found = {}
+  if names then
+    for _, n in ipairs(names) do
+      if not seen_name[n] then not_found[#not_found+1] = n end
+    end
+  end
+  if file_paths then
+    for _, p in ipairs(file_paths) do
+      if not seen_path[p] then not_found[#not_found+1] = p end
+    end
+  end
+
+  local ok = true
+  if #to_delete > 0 then
+    ok = mp:DeleteClips(to_delete) and true or false
+  end
+
+  return {
+    success = ok and #not_found == 0 and #in_use_skipped == 0,
+    deleted_ok = ok,
+    bin_name = folder:GetName(),
+    deleted_count = #to_delete,
+    deleted = matched,
+    in_use_skipped_count = #in_use_skipped,
+    in_use_skipped = in_use_skipped,
+    not_found_count = #not_found,
+    not_found = not_found,
+    forced = force,
+  }
+end
+
+-- ══════════════════════════════════════════════════════════════════════════
 -- Refresh already-placed banners in place (added 2026-07-21)
 --
 -- Why this exists: the whole point of a stable "<PREFIX>_<seq>.png" filename
@@ -671,6 +888,188 @@ ACTIONS.refresh_bin_clips = function(params)
     skipped_count = skipped,
     failed_count = #failed,
     failed = failed,
+  }
+end
+
+-- Repoint already-placed clips at DIFFERENT files on disk (added 2026-08-09)
+--
+-- This is refresh_bin_clips' sibling. refresh_bin_clips calls
+-- MediaPoolItem:ReplaceClip(path) with the clip's OWN current path -- same
+-- file, new pixels. This action calls it with a DIFFERENT path, which is how
+-- a file gets renamed on disk without the timeline noticing: every
+-- TimelineItem referencing that MediaPoolItem keeps its position, duration
+-- and trim, because ReplaceClip only swaps what the MediaPoolItem points at.
+--
+-- Why it exists: banner PNGs are named <TAB>.r<row>.png, where the row number
+-- comes from a spreadsheet. Row numbers move when a scene is inserted, so the
+-- filename is not a stable identity -- see the 2026-08-03 incident where most
+-- of a batch of placed ProjectA banners silently began showing the wrong
+-- scene. Migrating to immutable stable IDs (ProjectD-017.png) means renaming
+-- the files, and delete-and-re-place would discard the editor's manual trims.
+-- This does not.
+--
+-- UNVERIFIED as of writing: whether the MediaPoolItem's NAME follows the new
+-- filename or keeps the old label. That's exactly what this action's
+-- name_before/name_after fields exist to answer -- run it on ONE clip and
+-- read them back before trusting it on a whole system.
+--
+-- params:
+--   mappings  = { { old_path = "...", new_path = "..." }, ... }   (required)
+--   bin_name  = optional; omit to search every bin in the Media Pool
+ACTIONS.relink_bin_clips = function(params)
+  local mappings = need(params, "mappings")
+  local bin_name = params.bin_name
+  local mp = proj():GetMediaPool()
+
+  -- Collect the candidate clips: one named bin, or the whole pool.
+  local clips = {}
+  if bin_name then
+    local folder = find_bin_by_name(mp, bin_name)
+    if not folder then
+      error("No Media Pool bin named '" .. bin_name .. "' found.")
+    end
+    clips = folder:GetClipList() or {}
+  else
+    local queue = { mp:GetRootFolder() }
+    local head = 1
+    while head <= #queue do
+      local folder = queue[head]
+      head = head + 1
+      for _, c in ipairs(folder:GetClipList() or {}) do clips[#clips+1] = c end
+      for _, f in ipairs(folder:GetSubFolderList() or {}) do queue[#queue+1] = f end
+    end
+  end
+
+  -- Index them by their current File Path so each mapping resolves exactly
+  -- once. A path that matches two clips is ambiguous and must not be guessed.
+  local by_path = {}
+  local dupes = {}
+  for _, c in ipairs(clips) do
+    local ok, path = pcall(function() return c:GetClipProperty("File Path") end)
+    if ok and path and path ~= "" then
+      if by_path[path] then dupes[path] = true end
+      by_path[path] = c
+    end
+  end
+
+  local relinked = {}
+  local failed = {}
+
+  for _, m in ipairs(mappings) do
+    local old_path = m.old_path
+    local new_path = m.new_path
+    local clip = old_path and by_path[old_path] or nil
+
+    if not old_path or not new_path then
+      failed[#failed+1] = { old_path = old_path, new_path = new_path,
+                            error = "Both old_path and new_path are required." }
+    elseif dupes[old_path] then
+      failed[#failed+1] = { old_path = old_path, new_path = new_path,
+                            error = "More than one Media Pool clip has this File Path -- refusing to guess which one to relink." }
+    elseif not clip then
+      failed[#failed+1] = { old_path = old_path, new_path = new_path,
+                            error = "No Media Pool clip currently points at this path." }
+    else
+      local name_before = clip:GetName()
+      local ok_replace, replace_result = pcall(function() return clip:ReplaceClip(new_path) end)
+      if ok_replace and replace_result then
+        local _, path_after = pcall(function() return clip:GetClipProperty("File Path") end)
+        relinked[#relinked+1] = {
+          old_path    = old_path,
+          new_path    = new_path,
+          name_before = name_before,
+          name_after  = clip:GetName(),
+          path_after  = path_after,
+          -- The caller must check this: ReplaceClip can report success while
+          -- leaving the clip pointed at the old file.
+          path_confirmed = (path_after == new_path),
+        }
+      else
+        failed[#failed+1] = { old_path = old_path, new_path = new_path,
+                              name_before = name_before,
+                              error = tostring(replace_result) }
+      end
+    end
+  end
+
+  return {
+    success = #failed == 0,
+    relinked_count = #relinked,
+    relinked = relinked,
+    failed_count = #failed,
+    failed = failed,
+  }
+end
+
+-- Rename a Media Pool clip's LABEL (added 2026-08-09)
+--
+-- Why this exists: relink_bin_clips normally makes the clip's name follow the
+-- new filename automatically -- but not always. On 2026-08-09, all but one
+-- clip in a large batch relinked and renamed cleanly; the outlier (row 12)
+-- ended up with File Path = ProjectA-007.png and name still
+-- "ProjectA.r12.png". The link was correct; only the label was stale. That
+-- combination is worse than an outright failure, because every verification
+-- that matches clip name against the source list would report the wrong
+-- thing with total confidence.
+--
+-- Match is by File Path, never by name -- the name is the thing we don't
+-- trust here.
+--
+-- params:
+--   renames  = { { file_path = "...", name = "ProjectA-007.png" }, ... }  (required)
+--   bin_name = optional; omit to search every bin
+ACTIONS.rename_bin_clips = function(params)
+  local renames = need(params, "renames")
+  local bin_name = params.bin_name
+  local mp = proj():GetMediaPool()
+
+  local clips = {}
+  if bin_name then
+    local folder = find_bin_by_name(mp, bin_name)
+    if not folder then error("No Media Pool bin named '" .. bin_name .. "' found.") end
+    clips = folder:GetClipList() or {}
+  else
+    local queue = { mp:GetRootFolder() }
+    local head = 1
+    while head <= #queue do
+      local folder = queue[head]
+      head = head + 1
+      for _, c in ipairs(folder:GetClipList() or {}) do clips[#clips+1] = c end
+      for _, f in ipairs(folder:GetSubFolderList() or {}) do queue[#queue+1] = f end
+    end
+  end
+
+  local by_path = {}
+  for _, c in ipairs(clips) do
+    local ok, path = pcall(function() return c:GetClipProperty("File Path") end)
+    if ok and path and path ~= "" then by_path[path] = c end
+  end
+
+  local renamed, failed = {}, {}
+  for _, m in ipairs(renames) do
+    local clip = m.file_path and by_path[m.file_path] or nil
+    if not clip then
+      failed[#failed+1] = { file_path = m.file_path,
+                            error = "No Media Pool clip currently points at this path." }
+    else
+      local name_before = clip:GetName()
+      local ok_set = pcall(function() return clip:SetClipProperty("Clip Name", m.name) end)
+      local name_after = clip:GetName()
+      if ok_set and name_after == m.name then
+        renamed[#renamed+1] = { file_path = m.file_path,
+                                name_before = name_before, name_after = name_after }
+      else
+        failed[#failed+1] = { file_path = m.file_path, name_before = name_before,
+                              name_after = name_after,
+                              error = "SetClipProperty did not take effect." }
+      end
+    end
+  end
+
+  return {
+    success = #failed == 0,
+    renamed_count = #renamed, renamed = renamed,
+    failed_count = #failed, failed = failed,
   }
 end
 
@@ -817,15 +1216,16 @@ ACTIONS.import_banner_images = function(params)
   end
 
   -- IMPORTANT (discovered 2026-07-21, after switching to plain sequential
-  -- filenames like SCF_01.png, SCF_02.png, ...): passing a plain array of
-  -- file path strings to ImportMedia lets Resolve's own "detect image
-  -- sequence" heuristic kick in -- it silently merged all 13 banner PNGs
-  -- into ONE stitched clip named "SCF_[01-13].png" instead of 13 separate
-  -- MediaPoolItems, which then made every by-path re-match below fail
-  -- (confirmed via result.json, not guessed). Fix: pass each file as its
-  -- own clipInfo table ({FilePath=...}, no StartIndex/EndIndex) instead of
-  -- a bare string -- this tells Resolve each entry is one explicit still,
-  -- not a browsable sequence, and produces one MediaPoolItem per PNG.
+  -- filenames like ProjectA_01.png, ProjectA_02.png, ...): passing a plain
+  -- array of file path strings to ImportMedia lets Resolve's own "detect
+  -- image sequence" heuristic kick in -- it silently merged all 13 banner
+  -- PNGs into ONE stitched clip named "ProjectA_[01-13].png" instead of 13
+  -- separate MediaPoolItems, which then made every by-path re-match below
+  -- fail (confirmed via result.json, not guessed). Fix: pass each file as
+  -- its own clipInfo table ({FilePath=...}, no StartIndex/EndIndex) instead
+  -- of a bare string -- this tells Resolve each entry is one explicit
+  -- still, not a browsable sequence, and produces one MediaPoolItem per
+  -- PNG.
   -- Two earlier attempts on 2026-07-21 both failed and were confirmed
   -- failed via result.json (not guessed): {FilePath=p} alone, and
   -- {FilePath=p, StartIndex=0, EndIndex=0} both made ImportMedia return an
@@ -835,9 +1235,9 @@ ACTIONS.import_banner_images = function(params)
   -- per ImportMedia call) instead of the whole list in one call. Resolve's
   -- image-sequence auto-detection groups consecutively-numbered stills that
   -- are imported TOGETHER in the same call; importing each PNG in its own
-  -- call gives it nothing to group with, so SCF_01.png, SCF_02.png, ...
-  -- land as separate MediaPoolItems instead of one stitched
-  -- "SCF_[01-13].png" sequence clip.
+  -- call gives it nothing to group with, so ProjectA_01.png,
+  -- ProjectA_02.png, ... land as separate MediaPoolItems instead of one
+  -- stitched "ProjectA_[01-13].png" sequence clip.
   local imported = {}
   for _, p in ipairs(file_paths) do
     local single = mp:ImportMedia({ p })
@@ -1419,8 +1819,658 @@ ACTIONS.fusion_create_macro = function(params)
 end
 
 -- ══════════════════════════════════════════════════════════════════════════
+-- Banner fade (added 2026-08-04)
+--
+-- Reproduces the Edit page's white fade-handle grip, which has NO scripting
+-- API of any kind, by building the equivalent alpha ramp inside the clip's
+-- own Fusion comp:
+--     MediaIn1 -> BannerFade (BrightnessContrast) -> MediaOut1
+-- with Gain keyframed 0->1 across the head and 1->0 across the tail.
+--
+-- WHY Gain WITH THE ALPHA CHANNEL ENABLED, and not brightness: the banners
+-- are full-frame 1920x1080 PNGs whose content is transparency. Ramping
+-- brightness would fade a BLACK FULL-FRAME RECTANGLE in over the footage
+-- underneath instead of fading the banner. Gain with Alpha=1 scales the
+-- premultiplied RGBA together, which is a true opacity fade, and it stays
+-- scoped to this clip's layer — the video on the tracks below is untouched.
+--
+-- NOT RETRIM-SAFE. Keyframes sit at absolute comp frames, so changing the
+-- clip's DURATION afterwards strands them (trim the tail and the fade-out
+-- falls outside the visible range; trim the head and the fade-in is skipped).
+-- Moving the clip along the timeline is fine — only duration matters.
+-- Re-run this action after an editing pass, on the same cadence as
+-- /update-banner-timings. Unlike the real fade handle, it does not
+-- re-anchor by itself.
+--
+-- Idempotent: reuses an existing BannerFade tool instead of stacking a
+-- second one, so re-running over an already-faded clip is always safe.
+-- ══════════════════════════════════════════════════════════════════════════
+ACTIONS.set_clip_fade = function(params)
+  local track_index = params.track_index or 3
+  local clip_index = params.clip_index
+  local want_name = params.clip_name
+  local fade_in = params.fade_in_frames or 0
+  local fade_out = params.fade_out_frames or 0
+  -- Optional targeted repair for clips whose reported Fusion GlobalStart is
+  -- not their visible frame zero. Keep this opt-in: most clips are correctly
+  -- anchored by the comp range, but an empirically confirmed clip can need an
+  -- explicit visible origin without deleting/rebuilding its whole comp.
+  local visible_start_override = params.visible_start_frame
+
+  if clip_index == nil and want_name == nil then
+    error("Pass clip_name (preferred) or clip_index.")
+  end
+
+  local t = timeline()
+  local items = t:GetItemListInTrack("video", track_index)
+  if not items then
+    error("Video track " .. tostring(track_index) .. " does not exist.")
+  end
+
+  -- PREFER clip_name. GetItemListInTrack returns TRANSITIONS inline with
+  -- clips, so positional indices shift the moment one is added: confirmed
+  -- live 2026-08-04, when a Dip To Color Dissolve appeared at the r11/r12
+  -- boundary and pushed ProjectB.r12.png from index 6 to 7 — a batch
+  -- addressed by index then tried to fade the transition itself. Names are
+  -- stable.
+  local clip = nil
+  local resolved_by = nil
+  if want_name then
+    for _, item in ipairs(items) do
+      if item:GetName() == want_name then clip = item; resolved_by = "clip_name"; break end
+    end
+    if not clip then
+      local seen = {}
+      for _, item in ipairs(items) do seen[#seen+1] = item:GetName() end
+      error("No clip named '" .. tostring(want_name) .. "' on video track " ..
+            tostring(track_index) .. ". Track holds: " .. table.concat(seen, ", "))
+    end
+  else
+    clip = items[clip_index + 1]
+    if not clip then
+      error("Clip at video track " .. tostring(track_index) .. ", index " ..
+            tostring(clip_index) .. " not found.")
+    end
+    resolved_by = "clip_index"
+  end
+  local clip_name = clip:GetName()
+  local clip_duration = clip:GetDuration()
+
+  -- Confirmed live 2026-08-05: a clip can report a nonzero GlobalStart
+  -- (observed: 75 on a 765-frame clip) while its visible Fusion frame origin
+  -- is actually 0. Using the reported GlobalStart as-is delayed the fade-in
+  -- by exactly that many frames (2.5s at 30fps in the observed case), caught
+  -- during playback review. There is no general formula for detecting this
+  -- automatically (see comp_drift below for the closest available signal),
+  -- so a per-clip fix must go through the explicit visible_start_frame
+  -- override rather than a hardcoded name check.
+  if fade_in < 0 or fade_out < 0 then
+    error("fade_in_frames / fade_out_frames must not be negative.")
+  end
+  if fade_in + fade_out == 0 then
+    error("Both fade_in_frames and fade_out_frames are 0 — nothing to do.")
+  end
+  if clip_duration and (fade_in + fade_out) > clip_duration then
+    error("fade_in_frames + fade_out_frames (" .. tostring(fade_in + fade_out) ..
+          ") exceeds the duration of " .. clip_name .. " (" ..
+          tostring(clip_duration) .. " frames).")
+  end
+
+  -- CONFIRMED (2026-08-04): removing a transition does NOT shrink the
+  -- neighbouring clips' comps back — ProjectB.r11 kept a 117-frame comp on a
+  -- 110-frame clip after the Dip To Color Dissolve was deleted. The stretched
+  -- range is baked in, so the only way back to a correct anchor is to delete
+  -- the comp and let Resolve rebuild it at the clip's current length.
+  --
+  -- DESTRUCTIVE — off by default, and it discards EVERYTHING in the clip's
+  -- comps, not just BannerFade. Never set this on a clip carrying hand-built
+  -- Fusion work without asking first.
+  local comps_deleted = {}
+  if params.reset_comp then
+    local names = nil
+    pcall(function() names = clip:GetFusionCompNameList() end)
+    if names then
+      for _, nm in pairs(names) do
+        local gone = pcall(function() clip:DeleteFusionCompByName(nm) end)
+        comps_deleted[#comps_deleted+1] = { name = tostring(nm), deleted = gone }
+      end
+    end
+  end
+
+  local comp = clip:GetFusionCompByIndex(1)
+  local comp_created = false
+  if not comp then
+    comp = clip:AddFusionComp()
+    comp_created = true
+    if not comp then
+      error("Failed to create a Fusion composition on " .. clip_name .. ".")
+    end
+  end
+
+  -- Keyframes must be written in COMP frames, which for a clip-level comp is
+  -- not the same numbering as timeline frames. Read the range off the comp.
+  local attrs = comp:GetAttrs() or {}
+  local comp_start = attrs["COMPN_GlobalStart"]
+  local comp_end = attrs["COMPN_GlobalEnd"]
+  local range_source = "COMPN_GlobalStart/End"
+  if comp_start == nil or comp_end == nil then
+    comp_start = attrs["COMPN_RenderStart"]
+    comp_end = attrs["COMPN_RenderEnd"]
+    range_source = "COMPN_RenderStart/End"
+  end
+  if comp_start == nil or comp_end == nil then
+    error("Could not read the comp frame range on " .. clip_name ..
+          " (tried COMPN_GlobalStart/End and COMPN_RenderStart/End).")
+  end
+
+  -- CONFIRMED TRAP (2026-08-04, live-tested on ProjectB.r11 / ProjectB.r12). A
+  -- TRANSITION touching a clip makes Resolve extend that clip's Fusion comp
+  -- to cover the transition's media handles, so the comp is LONGER than the
+  -- clip and the comp's edges are no longer the clip's visible edges. A 15f
+  -- Dip To Color Dissolve on the r11/r12 cut split 7 frames into r11's tail
+  -- (comp 117 vs clip 110) and 8 into r12's head (comp_start = -8). Fades
+  -- anchored to the comp range then sit partly outside the visible clip:
+  -- every keyframe still reads back perfectly, and the fade is still wrong.
+  --
+  -- Rather than guess how the handle splits head vs tail — no single formula
+  -- fits both observed cases — this refuses to report success. Remove the
+  -- transition (or fade that clip by hand) and re-run.
+  local comp_len = comp_end - comp_start + 1
+  local comp_drift = nil
+  if clip_duration and comp_len ~= clip_duration then
+    comp_drift = {
+      comp_frames = comp_len,
+      clip_frames = clip_duration,
+      drift = comp_len - clip_duration,
+      note = "Comp range does not match clip duration — almost always a transition's media handles. The fade will not sit on the clip's visible edges.",
+    }
+  end
+
+  -- The comp can be LONGER than the clip: a trimmed clip keeps its unused
+  -- media as handles, and the comp spans all of it. Anchoring the fade to the
+  -- comp's edges then puts the ramp partly outside what's on screen — every
+  -- keyframe still verifies, and the fade is still wrong (ProjectB.r11 comp
+  -- 117 vs clip 110, ProjectB.r12 comp starting at -8). Deleting and
+  -- rebuilding the comp does NOT reset this; the range comes back identical.
+  --
+  -- Visible range. The ONLY reliable signal for "this comp carries handles" is
+  -- comp_len ~= clip_duration (comp_drift above). Split on that:
+  --
+  --   * comp_len == clip_duration -> the comp covers exactly the visible clip.
+  --     The visible range IS comp_start..comp_end, whatever the SIGN of
+  --     comp_start. A negative comp_start here just means Resolve numbered the
+  --     comp from a negative origin; there is no extra media, so clamping to 0
+  --     starts the fade-in LATE by |comp_start| frames.
+  --   * comp_len ~= clip_duration -> genuine handles (a transition's media).
+  --     How the handle splits head vs tail has no single fitting formula, so
+  --     keep the old behaviour of starting the picture at 0, and let
+  --     comp_range_drift stay loud in the output.
+  --
+  -- CORRECTED 2026-08-05 (spotted on playback review): the previous rule was
+  -- an unconditional max(comp_start, 0), fitted on ProjectB where negative
+  -- comp_start happened to COINCIDE with handles (r12: comp -8..583 = 592f vs
+  -- a 584f clip -> real drift). ProjectA disproved the general form:
+  -- ProjectA.r9 (comp -38..1760 = 1799f, clip 1799f) and ProjectA.r11 (comp
+  -- -51..273 = 325f, clip 325f) both have ZERO drift, so their whole comp is
+  -- the visible clip — and the clamp pushed their fade-in 38f (1.27s) and
+  -- 51f (1.70s) late. Fade-OUT was unaffected in both, since fade_end clamps
+  -- to comp_end. The other clips in that same batch had comp_len ==
+  -- clip_duration AND a positive comp_start, so they were already correct
+  -- and are unchanged by this fix.
+  local fade_start = comp_start
+  if comp_drift and fade_start < 0 then fade_start = 0 end
+  if visible_start_override ~= nil then
+    fade_start = tonumber(visible_start_override)
+    if fade_start == nil then
+      error("visible_start_frame must be numeric when provided.")
+    end
+  end
+  local fade_end = fade_start + (clip_duration or (comp_end - comp_start + 1)) - 1
+  -- An explicit visible origin is authoritative even when it differs from
+  -- GlobalStart; clamping it back to comp_end would shorten the visible range.
+  if visible_start_override == nil and fade_end > comp_end then fade_end = comp_end end
+
+  -- Locate MediaIn / MediaOut, plus any BannerFade left by a previous run.
+  local media_in, media_out, fade_tool = nil, nil, nil
+  for _, tool in pairs(comp:GetToolList(false) or {}) do
+    local a = tool:GetAttrs() or {}
+    local reg_id, nm = a["TOOLS_RegID"], a["TOOLS_Name"]
+    if nm == "BannerFade" then
+      fade_tool = tool
+    elseif reg_id == "MediaIn" then
+      media_in = tool
+    elseif reg_id == "MediaOut" then
+      media_out = tool
+    end
+  end
+  if not media_in then
+    error("No MediaIn tool in the comp on " .. clip_name .. ".")
+  end
+  if not media_out then
+    error("No MediaOut tool in the comp on " .. clip_name .. ".")
+  end
+
+  local reused = fade_tool ~= nil
+  if not fade_tool then
+    fade_tool = comp:AddTool("BrightnessContrast", 0, 0)
+    if not fade_tool then
+      error("Fusion rejected the BrightnessContrast tool on " .. clip_name .. ".")
+    end
+    fade_tool:SetAttrs({ TOOLS_Name = "BannerFade" })
+  end
+
+  -- Wire MediaIn -> BannerFade -> MediaOut (safe to repeat).
+  pcall(function() fade_tool:SetInput("Input", media_in) end)
+  pcall(function() media_out:SetInput("Input", fade_tool) end)
+
+  -- Drive every channel INCLUDING alpha, so this is an opacity fade.
+  local channels = {}
+  for _, ch in ipairs({ "Red", "Green", "Blue", "Alpha" }) do
+    local ok = pcall(function() fade_tool:SetInput(ch, 1) end)
+    channels[ch] = ok
+  end
+
+  -- Build and write the Gain keyframes. Times are inclusive comp frames.
+  -- Curve shape. "smooth" is a smoothstep ease (slow off the floor, slow into
+  -- the ceiling); "linear" reproduces the Edit page grip's straight ramp.
+  -- The curve is SAMPLED ONE KEY PER FRAME rather than expressed with bezier
+  -- handles: handle geometry is another corner of this API with a habit of
+  -- accepting values and doing nothing, and at 10 frames a ramp the extra
+  -- keys cost nothing while making the shape exactly what we asked for.
+  local ease_mode = params.ease or "smooth"
+  local function ease_fn(x)
+    if x <= 0 then return 0 end
+    if x >= 1 then return 1 end
+    if ease_mode == "linear" then return x end
+    return x * x * (3 - 2 * x)
+  end
+
+  local keys = {}
+  if fade_in > 0 then
+    for i = 0, fade_in do
+      keys[#keys+1] = { edge = "in", time = fade_start + i, value = ease_fn(i / fade_in) }
+    end
+  end
+  if fade_out > 0 then
+    for i = 0, fade_out do
+      keys[#keys+1] = { edge = "out", time = fade_end - fade_out + i, value = ease_fn(1 - (i / fade_out)) }
+    end
+  end
+
+  -- CONFIRMED FAILURE + FIX (2026-08-04, live-tested). The obvious route,
+  -- fade_tool:SetInput("Gain", value, time), reports success on every call
+  -- but does NOT create keyframes on an input that isn't animated yet — it
+  -- just overwrites one static value, so the last write wins and the whole
+  -- ramp collapses (read-back showed Gain = 0 at all four times, leaving the
+  -- banner permanently invisible). The input must first be CONNECTED to a
+  -- BezierSpline; only then does it hold per-frame values.
+  -- CONFIRMED FAILURE + FIX (2026-08-04, live-tested, two rounds).
+  --   Round 1: fade_tool:SetInput("Gain", value, time) reports success on
+  --   every call but does NOT keyframe an input that isn't animated yet — it
+  --   overwrites one static value, last write wins, ramp collapses to 0 and
+  --   the banner goes permanently invisible.
+  --   Round 2: connecting a BezierSpline and then indexing the SPLINE object
+  --   (spline[time] = value) also reported success with zero effect.
+  -- The working idiom indexes the INPUT, not the spline: tool.Gain[t] = v,
+  -- after tool.Gain has been connected to a BezierSpline.
+  local anim_attempts = {}
+  local spline = nil
+  pcall(function() comp:Lock() end)
+
+  local ok_a, err_a = pcall(function()
+    spline = comp:BezierSpline()
+    fade_tool.Gain = spline
+  end)
+  anim_attempts[#anim_attempts+1] = {
+    method = "tool.Gain = comp:BezierSpline()",
+    ok = ok_a, err = (not ok_a) and tostring(err_a) or nil,
+  }
+
+  -- Counts the keys actually living on the spline, which is the only
+  -- trustworthy signal here — every write idiom tried so far has returned
+  -- success regardless of whether anything landed.
+  local function key_count()
+    local n = 0
+    local ok, kf = pcall(function() return spline:GetKeyFrames() end)
+    if ok and kf then
+      for _ in pairs(kf) do n = n + 1 end
+    end
+    return n, (ok and kf or nil)
+  end
+
+  local landed, dump = 0, nil
+  if ok_a and spline then
+    local idioms = {
+      { name = "tool.Gain[time] = value", fn = function()
+          for _, k in ipairs(keys) do fade_tool.Gain[k.time] = k.value end
+        end },
+      { name = "spline:SetKeyFrames{[t]={v}}", fn = function()
+          local kf = {}
+          for _, k in ipairs(keys) do kf[k.time] = { k.value } end
+          spline:SetKeyFrames(kf)
+        end },
+      { name = "spline[time] = value", fn = function()
+          for _, k in ipairs(keys) do spline[k.time] = k.value end
+        end },
+    }
+    for _, idiom in ipairs(idioms) do
+      local ok_i, err_i = pcall(idiom.fn)
+      local n, kf = key_count()
+      anim_attempts[#anim_attempts+1] = {
+        method = idiom.name, ok = ok_i,
+        err = (not ok_i) and tostring(err_i) or nil,
+        keys_on_spline_after = n,
+      }
+      landed, dump = n, kf
+      if n >= #keys then break end
+    end
+  end
+
+  -- CONFIRMED TRAP (2026-08-04, live-tested on ProjectB.r6). Connecting a spline
+  -- to an input that already held a static value makes Fusion auto-key that
+  -- OLD value at the comp's current frame. All four intended keys read back
+  -- perfectly while a stray key at frame 235 holding 0 dragged the middle of
+  -- the clip to invisible (Gain measured 0.9 at f100, 0.23 at f200). The
+  -- per-keyframe read-back is blind to this — it only checks times it wrote.
+  --
+  -- DeleteKeyFrames is NOT a fix: both spline:DeleteKeyFrames(t, t) and
+  -- (t) returned true and left the key in place (plateau still read 0.23
+  -- after a "successful" delete). So strays are OVERWRITTEN with the value
+  -- the ramp should have at that frame, which is correct no matter where the
+  -- stray landed. Deletion is still attempted first, purely for tidiness.
+  local function intended_gain(t)
+    if t <= fade_start or t >= fade_end then return 0 end
+    if fade_in > 0 and t < fade_start + fade_in then
+      return ease_fn((t - fade_start) / fade_in)
+    end
+    if fade_out > 0 and t > fade_end - fade_out then
+      return ease_fn((fade_end - t) / fade_out)
+    end
+    return 1
+  end
+
+  local strays = {}
+  if ok_a and spline then
+    local wanted = {}
+    for _, k in ipairs(keys) do wanted[k.time] = true end
+    local ok_kf, kf = pcall(function() return spline:GetKeyFrames() end)
+    if ok_kf and kf then
+      for t, _ in pairs(kf) do
+        if not wanted[t] then
+          local want_val = intended_gain(t)
+          local gone = pcall(function() spline:DeleteKeyFrames(t, t) end)
+          if not gone then
+            gone = pcall(function() spline:DeleteKeyFrames(t) end)
+          end
+          -- Whether or not the delete claims to have worked, force the value.
+          local fixed = pcall(function() fade_tool.Gain[t] = want_val end)
+          local ok_r, now = pcall(function() return fade_tool:GetInput("Gain", t) end)
+          strays[#strays+1] = {
+            time = t,
+            delete_reported = gone,
+            overwritten_to = want_val,
+            overwrite_ok = fixed,
+            read_back = (ok_r and type(now) == "number") and now or nil,
+          }
+        end
+      end
+    end
+  end
+
+  pcall(function() comp:Unlock() end)
+
+  local spline_keys = {}
+  if dump then
+    for t, v in pairs(dump) do
+      spline_keys[#spline_keys+1] = { time = t, raw = tostring(v) }
+    end
+  end
+
+  for _, k in ipairs(keys) do k.set_ok = ok_a end
+
+  -- Prove the work. SetInput accepting a key with zero effect is a
+  -- well-documented trap in this project, so every keyframe is read back
+  -- and success is reported on the READ, never on the write.
+  local verified = true
+  local matched_count = 0
+  local failures = {}
+  for _, k in ipairs(keys) do
+    local ok, val = pcall(function() return fade_tool:GetInput("Gain", k.time) end)
+    local got = (ok and type(val) == "number") and val or nil
+    if got ~= nil and math.abs(got - k.value) < 0.001 then
+      matched_count = matched_count + 1
+    else
+      verified = false
+      failures[#failures+1] = { time = k.time, edge = k.edge, expected = k.value, read_back = got }
+    end
+  end
+
+  -- Guards the failure mode the per-keyframe check is blind to: the banner
+  -- must sit at FULL opacity across the middle of the clip, not just at the
+  -- four times we wrote. Sampled midway between the end of the fade-in and
+  -- the start of the fade-out.
+  local plateau = nil
+  local lo = fade_start + fade_in
+  local hi = fade_end - fade_out
+  if hi > lo then
+    local mid = math.floor((lo + hi) / 2)
+    local ok_p, val_p = pcall(function() return fade_tool:GetInput("Gain", mid) end)
+    local got = (ok_p and type(val_p) == "number") and val_p or nil
+    local good = (got ~= nil) and (math.abs(got - 1) < 0.001)
+    plateau = { time = mid, expected = 1, read_back = got, matches = good }
+    if not good then verified = false end
+  end
+
+  local alpha_ok, alpha_val = pcall(function() return fade_tool:GetInput("Alpha") end)
+
+  return {
+    success = verified,
+    verified = verified,
+    clip_name = clip_name,
+    track_index = track_index,
+    clip_index = clip_index,
+    resolved_by = resolved_by,
+    clip_duration = clip_duration,
+    comp_created = comp_created,
+    comps_deleted = comps_deleted,
+    fade_tool_reused = reused,
+    comp_start = comp_start,
+    comp_end = comp_end,
+    comp_range_source = range_source,
+    comp_range_drift = comp_drift,
+    visible_start_frame_override = visible_start_override,
+    fade_start = fade_start,
+    fade_end = fade_end,
+    fade_in_frames = fade_in,
+    fade_out_frames = fade_out,
+    channels_enabled = channels,
+    alpha_input_read_back = (alpha_ok and alpha_val or nil),
+    ease = ease_mode,
+    keyframes_written = #keys,
+    keyframes_matched = matched_count,
+    keyframe_failures = failures,
+    animation_attempts = anim_attempts,
+    keys_landed_on_spline = landed,
+    spline_keyframes = spline_keys,
+    stray_keys_removed = strays,
+    plateau_check = plateau,
+  }
+end
+
+
+-- ══════════════════════════════════════════════════════════════════════════
 -- Main — read command.json, run each command, write result.json
 -- ══════════════════════════════════════════════════════════════════════════
+
+-- RETIRED 2026-08-05 by Kiro. Automated Fusion fades produced visible-edge
+-- mismatches on multiple banner clips even when keyframe read-back reported
+-- success. Keep the historical implementation above for diagnosis only, but
+-- make the public action fail closed so no future run can recreate the effect.
+ACTIONS.set_clip_fade = function(_)
+  error("set_clip_fade is retired for this project. Kiro applies banner fades manually in DaVinci Resolve.")
+end
+
+-- Remove only the project-created BannerFade node from one timeline clip.
+-- This is the inverse of set_clip_fade and preserves the clip, its timing,
+-- its Fusion composition, and every unrelated Fusion tool. The source that
+-- fed BannerFade is reconnected directly to MediaOut before the fade node is
+-- deleted, then both the deletion and the final wiring are read back.
+-- Added 2026-08-05 when Kiro retired automated Fusion fades.
+ACTIONS.remove_clip_fade = function(params)
+  local track_index = params.track_index or 3
+  local clip_index = params.clip_index
+  local want_name = params.clip_name
+
+  if clip_index == nil and want_name == nil then
+    error("Pass clip_name (preferred) or clip_index.")
+  end
+
+  local items = timeline():GetItemListInTrack("video", track_index)
+  if not items then
+    error("Video track " .. tostring(track_index) .. " does not exist.")
+  end
+
+  local clip, resolved_by = nil, nil
+  if want_name then
+    for _, item in ipairs(items) do
+      if item:GetName() == want_name then
+        clip, resolved_by = item, "clip_name"
+        break
+      end
+    end
+    if not clip then
+      error("No clip named '" .. tostring(want_name) .. "' on video track " ..
+            tostring(track_index) .. ".")
+    end
+  else
+    clip = items[clip_index + 1]
+    if not clip then
+      error("Clip at video track " .. tostring(track_index) .. ", index " ..
+            tostring(clip_index) .. " not found.")
+    end
+    resolved_by = "clip_index"
+  end
+
+  local clip_name = clip:GetName()
+  local comp_names = nil
+  pcall(function() comp_names = clip:GetFusionCompNameList() end)
+  local comp_count = 0
+  if comp_names then
+    for _ in pairs(comp_names) do comp_count = comp_count + 1 end
+  end
+
+  -- GetFusionCompNameList may be unavailable or empty even when index 1 is
+  -- readable, so probe one comp before concluding there is nothing to remove.
+  if comp_count == 0 then
+    local first = nil
+    pcall(function() first = clip:GetFusionCompByIndex(1) end)
+    if first then comp_count = 1 end
+  end
+
+  local removed = {}
+  local failed = {}
+  local inspected = 0
+
+  for ci = 1, comp_count do
+    local comp = nil
+    pcall(function() comp = clip:GetFusionCompByIndex(ci) end)
+    if comp then
+      inspected = inspected + 1
+      local media_in, media_out, fade_tool = nil, nil, nil
+      for _, tool in pairs(comp:GetToolList(false) or {}) do
+        local a = tool:GetAttrs() or {}
+        local reg_id, nm = a["TOOLS_RegID"], a["TOOLS_Name"]
+        if nm == "BannerFade" then
+          fade_tool = tool
+        elseif reg_id == "MediaIn" and media_in == nil then
+          media_in = tool
+        elseif reg_id == "MediaOut" and media_out == nil then
+          media_out = tool
+        end
+      end
+
+      if fade_tool then
+        local source_tool = nil
+        pcall(function()
+          local input = fade_tool["Input"]
+          local out = input and input:GetConnectedOutput() or nil
+          source_tool = out and out.GetTool and out:GetTool() or nil
+        end)
+        if not source_tool then source_tool = media_in end
+
+        if not source_tool or not media_out then
+          failed[#failed+1] = {
+            comp_index = ci,
+            error = "Could not resolve BannerFade's source and MediaOut safely.",
+          }
+        else
+          local source_attrs = source_tool:GetAttrs() or {}
+          local source_name = source_attrs["TOOLS_Name"]
+          local rewired, rewire_err = pcall(function()
+            media_out:SetInput("Input", source_tool)
+          end)
+          local deleted, delete_err = false, nil
+          if rewired then
+            deleted, delete_err = pcall(function() fade_tool:Delete() end)
+          end
+
+          local fade_still_present = false
+          for _, tool in pairs(comp:GetToolList(false) or {}) do
+            local a = tool:GetAttrs() or {}
+            if a["TOOLS_Name"] == "BannerFade" then
+              fade_still_present = true
+              break
+            end
+          end
+
+          local output_source_after = nil
+          pcall(function()
+            local input = media_out["Input"]
+            local out = input and input:GetConnectedOutput() or nil
+            local src = out and out.GetTool and out:GetTool() or nil
+            local a = src and src:GetAttrs() or nil
+            output_source_after = a and a["TOOLS_Name"] or nil
+          end)
+
+          local verified = rewired and deleted and not fade_still_present and
+                           output_source_after == source_name
+          if verified then
+            removed[#removed+1] = {
+              comp_index = ci,
+              source_tool = source_name,
+              output_source_after = output_source_after,
+              verified = true,
+            }
+          else
+            failed[#failed+1] = {
+              comp_index = ci,
+              source_tool = source_name,
+              rewired = rewired,
+              rewire_error = (not rewired) and tostring(rewire_err) or nil,
+              deleted = deleted,
+              delete_error = (not deleted) and tostring(delete_err) or nil,
+              fade_still_present = fade_still_present,
+              output_source_after = output_source_after,
+            }
+          end
+        end
+      end
+    end
+  end
+
+  return {
+    success = #failed == 0,
+    clip_name = clip_name,
+    track_index = track_index,
+    clip_index = clip_index,
+    resolved_by = resolved_by,
+    comps_inspected = inspected,
+    removed_count = #removed,
+    removed = removed,
+    failed_count = #failed,
+    failed = failed,
+  }
+end
 
 local raw = read_file(COMMAND_FILE)
 
